@@ -1,0 +1,253 @@
+import com.theplatform.ingest.adapter.api.AdapterException
+import com.theplatform.ingest.adapter.api.AdapterResultItem
+import com.theplatform.data.api.objects.type.CategoryInfo
+import com.theplatform.data.api.objects.type.DateOnly
+import com.theplatform.data.api.objects.type.Duration
+import com.theplatform.ingest.data.objects.IngestMedia
+import com.theplatform.ingest.data.objects.IngestMediaFile
+import com.theplatform.ingest.data.objects.WorkflowOption
+import java.text.SimpleDateFormat
+
+// The Watch Folder agent adds the name of the source metafile
+// to the map of additional parameters. You can read it in your
+// script (using the filename key), should you need to record it.
+// The path information is relative to watch folder URL.
+// The path also includes the filename.
+def filename = adapterSettings.getAdditionalParameterMap().get("filename")
+def filepath = adapterSettings.getAdditionalParameterMap().get("filePath")
+
+def cfNamespace = "http://access.auth.theplatform.com/data/Account/2401906690"
+
+SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssz");
+
+def records
+def insts
+
+try {
+    // XmlSlurper is an XML parser built into Groovy.
+    records = new XmlSlurper(false,true).parse(metadata).declareNamespace(video:"http://www.omnisport.tv/rss/video.html", media:"http://search.yahoo.com/mrss/",perform:"http://www.performgroup.com/mrss/")
+} catch(Exception e) {
+    // If the XML isn't parseable, throw an AdapterException from here.
+    // Script execution halts and the error is returned to the caller.
+    throw new AdapterException(e)
+}
+
+insts = records.channel
+def items = insts.item
+
+items.each {
+	// If the metadata has what we want, this will remain null.
+	Exception ex = null
+
+	def firstContent = it."media:group"."media:content"[0]
+	def myUrl = firstContent.@url.text()
+	def myType = firstContent.@type.text()
+
+//If the file ends in mp4 we assume its a video
+if (myUrl != "" && myUrl.endsWith("mp4") ) {	
+
+
+
+	// Create a new IngestMedia item. We'll populate 
+	// its fields with elements from the input XML.
+	IngestMedia media = new IngestMedia()
+
+	media.setCustomValue(cfNamespace,"videoSource","OMNISPORT")
+
+
+	if (it."video:id" != "") {
+		def guid = it."video:id".text()
+		media.guid = guid
+		media.setCustomValue(cfNamespace,"videoSourceAssetId",guid)
+	}
+
+//TODO: find an existing media with the guid. if it exists then update or do nothing.
+
+	if (it."video:title" != "")
+		media.title = it."video:title"
+
+//NOTE: if it.description is used. it duplicates the content of the description??
+	if (it."video:description" != "")
+		media.description = it."video:description"
+
+	if (it."media:keywords" != "")
+		media.keywords = it."media:keywords"
+		
+	//media.availableDate
+//	if (it."video:releaseDate" != null) {
+	if (it."video:releaseDate".text() != "") {
+		media.availableDate = sdf.parse(it."video:releaseDate".text()+"SGT")
+   }
+
+	//media.expirationDate
+	//if (it."video:expirationDate" != null) {
+	if (it."video:expirationDate".text() != "") {
+		media.expirationDate = sdf.parse(it."video:expirationDate".text()+"SGT")
+	}
+
+//TODO: Populate sports values
+//perform:keywords
+//perform:keyword@type
+def performKeywords = it."perform:keywords"."perform:keyword"
+def pfmSports = []
+def pfmComp = []
+def pfmTeams = []
+def pfmPeople = []
+def pfmContext = []
+def catArrList = []
+CategoryInfo catInfo = new CategoryInfo()
+performKeywords.each {
+	if (it.@type.text() == "Sport") {
+		pfmSports << it.text()
+		def myCat = MapToMpxCategory(it.text())
+		catInfo.name = myCat
+		catArrList << catInfo;
+	}
+
+	if (it.@type.text().endsWith("Competition") || it.@type.text().endsWith("Tour"))
+			pfmComp << it.text()
+
+	if (it.@type.text().endsWith("Teams"))
+			pfmTeams << it.text()
+
+	if (it.@type.text().endsWith("People"))
+			pfmPeople << it.text()
+
+	if (it.@type.text().endsWith("Context"))
+			pfmContext << it.text()
+
+}
+media.categories = catArrList
+media.setCustomValue(cfNamespace,"sports",pfmSports)
+media.setCustomValue(cfNamespace,"competitions",pfmComp)
+media.setCustomValue(cfNamespace,"teams",pfmTeams)
+media.setCustomValue(cfNamespace,"people",pfmPeople)
+media.setCustomValue(cfNamespace,"context",pfmContext)
+media.setCustomValue(null,"isLive", false)
+media.setCustomValue(null,"isFree",true)
+
+//Exclude China and Japan. This is b/c of JLeague and China League rights.
+List<String> list2 = new ArrayList<String>()
+list2.add("jp")
+list2.add("cn")
+media.countries = list2.toArray()
+media.excludeCountries = true
+
+
+	ingestMediaFiles = []
+	IngestMediaFile mediaFileSource = new IngestMediaFile()
+
+//	media:group
+//		media:content  @fileSize , @duration,  @url, @type, @height, @width
+
+
+	if (firstContent.@url.text().startsWith("file://")) {
+		mediaFileSource.sourceUrl = firstContent.@url.text().substring(7)
+	} else {
+		mediaFileSource.sourceUrl = firstContent.@url.text()
+	}
+
+	mediaFileSource.fileSize = Integer.parseInt(firstContent.@fileSize.text())
+	
+	mediaFileSource.isDefault = true
+	//mediaFileSource.assetTypes = ["Mezzanine Video"]
+
+	//duration
+	def myDuration = firstContent.@duration.text() != "" ? firstContent.@duration.text().split(':') : null
+	if (myDuration != null) {
+		mediaFileSource.duration = new Duration((Math.round(myDuration[0].toLong())), 
+												(Math.round(myDuration[1].toLong())), 
+												(Math.floor(myDuration[2].toDouble()).toLong()), 
+												0)
+	}
+	
+	ingestMediaFiles << mediaFileSource
+	
+	// Add the media files to the media items.
+	if (ingestMediaFiles.size() > 0) {
+		media.setContent(ingestMediaFiles.toArray(new IngestMediaFile[ingestMediaFiles.size()]))
+	}
+	
+    // Create the result item and populate it with either the media data 
+    // or the exception for a missing description. Then add to the queue.
+    AdapterResultItem resultItem = new AdapterResultItem()
+
+    if (ex != null) {
+        resultItem.setException(ex)
+    } else {
+        resultItem.media = media
+    }
+
+    resultQueue.put(resultItem)
+
+ //end of if its an mp4
+} else if (myType.endsWith("jpg") || myType.endsWith("jpeg")) {
+	// Find the video and create the image
+	//
+	// If the metadata has what we want, this will remain null.
+	Exception ex2 = null
+
+	IngestMedia media2 = new IngestMedia()
+
+	if (mediaHelper.mediaExistsByGuid(it."video:id".text())) {
+		//found a video with the correct GUID
+		media2.guid = it."video:id".text()
+
+		
+		ingestMediaThumbnailFiles = []
+		IngestMediaFile mediaThumbnailFileSource = new IngestMediaFile()
+
+	if (firstContent.@url.text().startsWith("file://")) {
+		mediaThumbnailFileSource.sourceUrl = firstContent.@url.text().substring(7).replace(".anchor","_1.jpeg")
+	} else {
+		mediaThumbnailFileSource.sourceUrl = firstContent.@url.text().replace(".anchor","_1.jpeg")
+	}
+
+//		mediaFileSource.fileSize = Integer.parseInt(firstContent.@fileSize.text())
+	
+		ingestMediaThumbnailFiles << mediaThumbnailFileSource
+
+		if (ingestMediaThumbnailFiles.size() > 0) {
+			media2.setThumbnails(ingestMediaThumbnailFiles.toArray(new IngestMediaFile[ingestMediaThumbnailFiles.size()]))
+		}
+
+    AdapterResultItem resultItem = new AdapterResultItem()
+
+    if (ex2 != null) {
+        resultItem.setException(ex2)
+    } else {
+        resultItem.media = media2
+    }
+
+    resultQueue.put(resultItem)
+
+
+	} else {
+      AdapterResultItem resultItem = new AdapterResultItem()
+		ex2 = new Exception("No Video found")		
+		resultItem.setException(ex2)
+		resultQueue.put(resultItem)
+	}
+}
+//TODO what happens if the image xml comes first and it deletes the xml file?
+
+
+}
+
+def MapToMpxCategory(feedCat) {
+	def mPxCat = "Sports News"
+	if (feedCat == "Football") {
+		mPxCat = "Soccer"
+	} else if (feedCat == "Motorsport") {
+		mPxCat = "Auto Racing"
+	} else if (feedCat == "Tennis") {
+		mPxCat = "Tennis"
+	} else if (feedCat == "Golf") {
+		mPxCat = "Golf"
+	} else if (feedCat == "Baseball") {
+		mPxCat = "Baseball"
+	} else if (feedCat == "Basketball") {
+		mPxCat = "Basketball"
+	}
+	return mPxCat
+}
